@@ -1,5 +1,7 @@
 #include <ruby.h>
 #include <ruby/encoding.h>
+#include <stdbool.h>
+
 // CSV specifications.
 // http://tools.ietf.org/html/rfc4180
 // http://w3c.github.io/csvw/syntax/#ebnf
@@ -40,6 +42,7 @@ typedef struct {
 
   action open_quote {
     unclosed_line = curline;
+    in_quoted_field = true;
   }
 
   action close_quote {
@@ -58,41 +61,51 @@ typedef struct {
   }
 
   action read_quoted {
-    if (p == ts) {
-      field = rb_enc_str_new("", 0, encoding);
-      ENCODE;
-    }
-    // @note If we add an action on '""', we can skip some steps if no '""' is found.
-    else if (p > ts) {
-      // Operating on ts in-place produces odd behavior, FYI.
-      char *copy = ALLOC_N(char, p - ts);
-      memcpy(copy, ts, p - ts);
-
-      char *reader = ts, *writer = copy;
-      int escaped = 0;
-
-      while (p > reader) {
-        if (*reader == quote_char && !escaped) {
-          // Skip the escaping character.
-          escaped = 1;
-        }
-        else {
-          escaped = 0;
-          *writer++ = *reader;
-        }
-        reader++;
+    if (!use_parse_quoted_field) {
+      if (p == ts) {
+        field = rb_enc_str_new("", 0, encoding);
+        ENCODE;
       }
+      // @note If we add an action on '""', we can skip some steps if no '""' is found.
+      else if (p > ts) {
+        // Operating on ts in-place produces odd behavior, FYI.
+        char *copy = ALLOC_N(char, p - ts);
+        memcpy(copy, ts, p - ts);
 
-      field = rb_enc_str_new(copy, writer - copy, encoding);
-      ENCODE;
+        char *reader = ts, *writer = copy;
+        int escaped = 0;
 
-      if (copy != NULL) {
-        free(copy);
+        while (p > reader) {
+          if (*reader == quote_char && !escaped) {
+            // Skip the escaping character.
+            escaped = 1;
+          }
+          else {
+            escaped = 0;
+            *writer++ = *reader;
+          }
+          reader++;
+        }
+
+        field = rb_enc_str_new(copy, writer - copy, encoding);
+        ENCODE;
+
+        if (copy != NULL) {
+          free(copy);
+        }
       }
+    } else {
+      // intentionally blank - see parse_quoted_field
     }
   }
 
   action new_field {
+    if (use_parse_quoted_field && in_quoted_field) {
+      parse_quoted_field(&field, encoding, quote_char, ts + 1, p - 1);
+      ENCODE;
+      in_quoted_field = false;
+    }
+
     rb_ary_push(row, field);
     field = Qnil;
   }
@@ -124,6 +137,12 @@ typedef struct {
     }
     else if (p > d->start) {
       rb_ivar_set(self, s_row, rb_str_new(d->start, p - d->start));
+    }
+
+    if (use_parse_quoted_field && in_quoted_field) {
+      parse_quoted_field(&field, encoding, quote_char, ts + 1, p - 1);
+      ENCODE;
+      in_quoted_field = false;
     }
 
     if (!NIL_P(field) || RARRAY_LEN(row)) { // same as new_field
@@ -202,6 +221,38 @@ static void rb_io_ext_int_to_encs(rb_encoding *ext, rb_encoding *intern, rb_enco
   }
 }
 
+static void parse_quoted_field(VALUE* field, rb_encoding* encoding, char quote_char, char* quoted_field_start, char *quoted_field_end) {
+  // read the full quoted field, handling any escape sequences
+  if (quoted_field_end == quoted_field_start) {
+    // empty quoted field is an empty string
+    *field = rb_enc_str_new("", 0, encoding);
+  } else {
+    // largest possible buffer. if there's escaping, the resulting string will
+    // not use the entire buffer
+    char *copy = ALLOC_N(char, quoted_field_end - quoted_field_start);
+    char *reader = quoted_field_start, *writer = copy;
+    int escaped = 0;
+
+    while (quoted_field_end > reader) {
+      if (*reader == quote_char && !escaped) {
+        // Skip the escaping character.
+        escaped = 1;
+      }
+      else {
+        escaped = 0;
+        *writer++ = *reader;
+      }
+      reader++;
+    }
+
+    *field = rb_enc_str_new(copy, writer - copy, encoding);
+
+    if (copy != NULL) {
+      free(copy);
+    }
+  }
+}
+
 static VALUE raw_parse(int argc, VALUE *argv, VALUE self) {
   int cs, act, have = 0, curline = 1, io = 0;
   char *ts = 0, *te = 0, *buf = 0, *eof = 0, *mark_row_sep = 0, *row_sep = 0;
@@ -216,6 +267,8 @@ static VALUE raw_parse(int argc, VALUE *argv, VALUE self) {
 
   VALUE option;
   char quote_char = '"', col_sep = ',';
+
+  bool in_quoted_field = false, use_parse_quoted_field = true;
 
   rb_scan_args(argc, argv, "11", &port, &opts);
   taint = OBJ_TAINTED(port);
@@ -236,6 +289,9 @@ static VALUE raw_parse(int argc, VALUE *argv, VALUE self) {
   else if (TYPE(opts) != T_HASH) {
     rb_raise(rb_eArgError, "options has to be a Hash or nil");
   }
+
+  option = rb_hash_aref(opts, ID2SYM(rb_intern("use_parse_quoted_field")));
+  use_parse_quoted_field = RTEST(option);
 
   option = rb_hash_aref(opts, ID2SYM(rb_intern("quote_char")));
   if (TYPE(option) == T_STRING && RSTRING_LEN(option) == 1) {
